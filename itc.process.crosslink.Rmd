@@ -1,0 +1,160 @@
+---
+title: "Process crosslinking data"
+output: html_notebook
+---
+## Packages
+```{r, warning=F}
+library(tidyverse)
+library(parallel)
+library(stringdist)
+```
+
+# Create directory structures and download all sequencing data in 1-original folder
+```{bash}
+mkdir -p ../1-original ../2-trim ../3-deduplicate ../4-count ../5-final
+```
+
+# Process cross-linking data
+### Trim cross-linking data with cutadapt 1.16
+```{bash}
+for file in ../1-original/cross*.gz; do
+  name=`echo ${file##*/}`
+  name_sans_ext=`echo ${file##*/} | sed 's/.fastq.gz//'`
+
+  echo ----------$name---------- >> ../2-trim/cutadapt_report.txt
+  cutadapt -e 0.2 -j 40 -m 34 -a TGGAATTCTCGGGTGCCAAGG --discard-untrimmed -o ../2-trim/$name_sans_ext.trim.fq $file &>> ../2-trim/cutadapt_report.txt
+done
+```
+
+### Deduplicate reads using dedupe.sh from BBtools
+```{bash}
+for file in ../2-trim/cross*.fq; do
+  name=`echo ${file##*/}`
+  deduped=`echo ${file##*/} | sed 's/.trim.fq/.dd.fq/'`
+  dedupedfile="../3-deduplicate/"$deduped
+
+  echo ----------$name---------- >>../3-deduplicate/dedupe_report.txt
+  /home/prshah/Software/pckgs/bbmap/dedupe.sh in=$file out=$dedupedfile s=2 nam=3 t=40 -Xmx100g &>>../3-deduplicate/dedupe_report.txt
+done
+```
+
+### Filter reads by length and count unique cross-links
+```{bash}
+for file in ../3-deduplicate/cross*.fq; do
+  name=`echo ${file##*/}`
+  count=`echo ${file##*/} | sed 's/.dd.fq/.unq.tsv/'`
+  unq="../4-count/"$count
+
+  cat $file | awk 'BEGIN {OFS = "\n"} {header = $0 ; getline seq ; getline qheader ; getline qseq ; if (length(seq) >= 34) {print seq}}' | sort | uniq -c | awk '{print $(NF-1)" "$NF}' > $unq
+  
+  unq2=`echo $unq | sed 's/.unq.tsv/.cross.n14.tsv/' `
+  python itc.crosslink.finalbc.py $unq | grep ' AACAAT ' >  $unq2
+done
+```
+
+### Process crosslink count data
+```{r}
+# function to count crosslinks per N14 and position
+cross.count <- function(data){
+  data %>%
+  mutate(Count = X1, cross = str_length(X4)) %>% 
+  select(cross, X6, Count) %>% 
+  group_by(X6, cross) %>% 
+  dplyr::summarise(tot = sum(Count)) %>%
+  ungroup()
+}
+
+##################################################################
+### Rif+ data
+
+# Get rif data filenames
+rif.list <- list.files("../4-count/", "crosslink.rif.*\\.n14.tsv", ignore.case = T, full.names = T)
+rep.ids <- strsplit(rif.list, "rif.|.ITC") %>% sapply(., `[[`, 2)
+
+# Read in rif data
+rif.data <- lapply(rif.list, read_delim, delim = " ", col_names = F)
+
+# Calculate crosslink counts for each N14 per position
+rif.counts <- lapply(rif.data, cross.count)
+names(rif.counts) <- rep.ids
+rm(rif.data) # to minimize memory usage
+
+# Combine technical replicate data
+rep1.Wrif <- rif.counts[grep("rep1", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rep2.Wrif <- rif.counts[grep("rep2", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rep3.Wrif <- rif.counts[grep("rep3", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rm(rif.counts) # to minimize memory usage
+
+write_delim(rep1.Wrif, "../5-final/crosslink.rif.rep1.counts.tsv", delim = "\t")
+write_delim(rep2.Wrif, "../5-final/crosslink.rif.rep2.counts.tsv", delim = "\t")
+write_delim(rep3.Wrif, "../5-final/crosslink.rif.rep3.counts.tsv", delim = "\t")
+
+##################################################################
+### Rif- data
+
+# Get rif- data filenames
+norif.list <- list.files("../4-count/", "crosslink.no.rif.*\\.n14.tsv", ignore.case = T, full.names = T)
+rep.ids <- strsplit(norif.list, "rif.|.ITC") %>% sapply(., `[[`, 2)
+
+# Read in rif- data
+norif.data <- lapply(norif.list, read_delim, delim = " ", col_names = F)
+
+# Calculate crosslink counts for each N14 per position
+norif.counts <- lapply(norif.data, cross.count)
+names(norif.counts) <- rep.ids
+rm(norif.data) # to minimize memory usage
+
+# Combine technical replicate data
+rep1.WOrif <- norif.counts[grep("rep1", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rep2.WOrif <- norif.counts[grep("rep2", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rep3.WOrif <- norif.counts[grep("rep3", rep.ids)] %>% 
+  purrr::reduce(full_join, by = c("X6", "cross")) %>%
+  replace(is.na(.), 0) %>%
+  mutate(total = tot.x + tot.y,
+         RNALength = 26-cross) %>%
+  dplyr::select(-c(tot.x, tot.y, cross)) %>%
+  dplyr::rename(N14 = X6)
+
+rm(rif.counts) # to minimize memory usage
+
+write_delim(rep1.WOrif, "../5-final/crosslink.no.rif.rep1.counts.tsv", delim = "\t")
+write_delim(rep2.WOrif, "../5-final/crosslink.no.rif.rep2.counts.tsv", delim = "\t")
+write_delim(rep3.WOrif, "../5-final/crosslink.no.rif.rep3.counts.tsv", delim = "\t")
+
+```
+

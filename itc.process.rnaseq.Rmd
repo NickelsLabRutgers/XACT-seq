@@ -1,0 +1,166 @@
+---
+title: "Process RNA-seq data"
+output: html_notebook
+---
+## Packages
+```{r, warning=F}
+library(tidyverse)
+library(parallel)
+library(stringdist)
+```
+
+# Create directory structures and download all sequencing data in 1-original folder
+```{bash}
+mkdir -p ../1-original ../2-trim ../3-deduplicate ../4-count ../5-final
+```
+
+# Process rnaseq data
+### Trim rnaseq data with cutadapt 1.16
+```{bash}
+for file in ../1-original/RNA*.gz; do
+  name=`echo ${file##*/}`
+  name_sans_ext=`echo ${file##*/} | sed 's/.fastq.gz//'`
+
+  echo ----------$name---------- >> ../2-trim/cutadapt_report.txt
+  cutadapt -e 0.3 -j 40 -M 70 --match-read-wildcards -a TGGAATTCTCGGGTGCCAACTCCAGTCAC --discard-untrimmed -o ../2-trim/$name_sans_ext.trim.fq $file &>> ../2-trim/cutadapt_report.txt
+done
+```
+
+### Deduplicate reads using dedupe.sh from BBtools
+```{bash}
+for file in ../2-trim/RNA*.fq; do
+  name=`echo ${file##*/}`
+  deduped=`echo ${file##*/} | sed 's/.trim.fq/.dd.fq/'`
+  dedupedfile="../3-deduplicate/"$deduped
+
+  echo ----------$name---------- >>../3-deduplicate/dedupe_report.txt
+  /home/prshah/Software/pckgs/bbmap/dedupe.sh in=$file out=$dedupedfile s=2 nam=3 t=40 -Xmx100g &>>../3-deduplicate/dedupe_report.txt
+done
+```
+
+### Combine reps
+```{bash}
+cat ../3-deduplicate/RNA.counts.rep1.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep1.2.ITC.dd.fq > ../3-deduplicate/RNA.counts.rep1.ITC.comb.dd.fq 
+cat ../3-deduplicate/RNA.counts.rep2.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep2.2.ITC.dd.fq > ../3-deduplicate/RNA.counts.rep2.ITC.comb.dd.fq 
+cat ../3-deduplicate/RNA.counts.rep3.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep3.2.ITC.dd.fq > ../3-deduplicate/RNA.counts.rep3.ITC.comb.dd.fq 
+
+rm ../3-deduplicate/RNA.counts.rep1.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep1.2.ITC.dd.fq ../3-deduplicate/RNA.counts.rep2.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep2.2.ITC.dd.fq ../3-deduplicate/RNA.counts.rep3.1.ITC.dd.fq ../3-deduplicate/RNA.counts.rep3.2.ITC.dd.fq
+```
+
+### Filter reads by length and split N11 and N14 barcodes
+### Estimate slippage events near transcription start site
+```{bash}
+for file in ../3-deduplicate/RNA*comb*.fq; do
+  name=`echo ${file##*/}`
+  lfix=`echo ${file##*/} | sed 's/.dd.fq/.lfix.fq/'`
+  leftfq=`echo ${file##*/} | sed 's/.dd.fq/.left.fq/'`
+  rghtfq=`echo ${file##*/} | sed 's/.dd.fq/.rght.fq/'`
+  rghtrn=`echo ${file##*/} | sed 's/.dd.fq/.rght.rn/'`
+  leftfix=`echo ${file##*/} | sed 's/.dd.fq/.left.fix.fq/'`
+  rghttsv=`echo ${file##*/} | sed 's/.dd.fq/.rght.tsv/'`
+  lefttsv=`echo ${file##*/} | sed 's/.dd.fq/.left.tsv/'`
+  combtsv=`echo ${file##*/} | sed 's/.dd.fq/.comb.tsv/'`
+  finaltsv=`echo ${file##*/} | sed 's/.dd.fq/.final.tsv/'`
+  unqn14tsv=`echo ${file##*/} | sed 's/.dd.fq/.unqn14.tsv/'`
+  
+  cat $file | awk 'BEGIN {OFS = "\n"} {header = $0 ; getline seq ; getline qheader ; getline qseq ; if (length(seq) >= 55) {print header, seq, qheader, qseq}}' > ../4-count/$lfix
+  
+  echo ----------$name---------- >> ../4-count/cutadapt_report.txt
+  cutadapt -e 0.2 -a GATAACAATTTCAA -o ../4-count/$leftfq -r ../4-count/$rghtfq ../4-count/$lfix --discard-untrimmed &>> ../4-count/cutadapt_report.txt
+  
+  awk 'BEGIN{FS=" "} {print $2}' ../4-count/$rghtfq > ../4-count/$rghtrn
+  awk 'BEGIN{FS=" "} {print $1}' ../4-count/$rghtfq > ../4-count/$rghttsv
+
+  python itc.rnaseq.subset.py ../4-count/$leftfq ../4-count/$rghtrn ../4-count/$leftfix
+  python itc.rnaseq.left.py ../4-count/$leftfix > ../4-count/$lefttsv
+
+  paste ../4-count/$lefttsv ../4-count/$rghttsv | grep -v "X" > ../4-count/$combtsv
+
+  cat ../4-count/$combtsv | awk '{gsub(/\t/, " "); gsub("  ", " "); print $0}' > tmp
+  mv tmp ../4-count/$combtsv
+
+  python itc.rnaseq.finalbc.py ../4-count/$combtsv > ../4-count/$finaltsv
+
+  sort ../4-count/$finaltsv | awk '{if(length($NF)==17) print}' | awk '{print substr($0, 1, length($0)-3)}' | uniq -c | awk '{print $(NF-3)" "$(NF-2)" "$(NF-1)" "$NF}' | sort -k2 > ../4-count/$unqn14tsv
+  
+  rm ../4-count/$lfix ../4-count/$leftfq ../4-count/$rghtfq ../4-count/$rghtrn ../4-count/$leftfix ../4-count/$lefttsv ../4-count/$rghttsv ../4-count/$combtsv
+done
+```
+
+### Process rnaseq count data
+```{r}
+# Get rnaseq data 
+rna.list <- list.files("../4-count/", "RNA.*\\.unqn14.tsv", ignore.case = T, full.names = T)
+rna.ids <- strsplit(rna.list, "counts.|.ITC") %>% sapply(., `[[`, 2)
+
+# Read in rnaseq data
+rna.data <- lapply(rna.list, read_delim, delim = " ", col_names = F)
+rna.data <- lapply(rna.data, function(x) x %>% 
+                     dplyr::rename(count = X1, n11 = X2, n14 = X4) %>%
+                     dplyr::select(-X3) %>%
+                     group_by(n14, n11) %>%
+                     dplyr::summarise(count = sum(count)) %>%
+                     ungroup())
+
+# Get number of unique N11 for each N14
+n14.cnt.n11 <- function(temp.data){
+  temp.data %>%
+  dplyr::select(-count) %>% 
+  group_by(n14) %>% 
+  dplyr::summarise(n = n_distinct(n11)) %>%
+  ungroup()
+}
+
+n14.cnt.11.list <- lapply(rna.data, n14.cnt.n11)
+  
+unq.n11.n14 <- lapply(1:3, function(x) left_join(n14.cnt.11.list[[x]] %>% 
+                                                   filter(n == 1),
+                                                 rna.data[[x]], by = "n14"))
+non.unq.n11.n14 <- lapply(1:3, function(x) left_join(n14.cnt.11.list[[x]] %>% 
+                                                       filter(n > 1),
+                                                 rna.data[[x]], by = "n14"))
+
+# For n14 with multiple n11, fix any sequencing errors
+fixn11 <- function(qc, q11, q14){
+  tmp1 <- data.frame(q11, q14, qc, stringsAsFactors = F)
+  tmp2 <- tmp1 %>% 
+    group_by(q11) %>% 
+    dplyr::summarise(weight = sum(qc))
+  
+  d <- c(stringdistmatrix(tmp2$q11))
+  if(max(d)<=4 | (max(tmp2$weight) >= 10)){
+    true.seq <- tmp2$q11[which.max(tmp2$weight)]
+  }else{
+    true.seq <- "NA"
+  }
+}
+
+fix.non.unq.n11.n14 <- mclapply(non.unq.n11.n14, function(x){
+    x %>% 
+    group_by(n14) %>%
+    mutate(newn11 = fixn11(q14 = n14, 
+                           q11 = n11,
+                           qc = count)) %>%
+    ungroup() %>%
+    mutate(n11 = newn11) %>% 
+    dplyr::select(-newn11) %>%
+    filter(n11 != "NA") %>%
+    dplyr::select(-n) %>%
+    group_by(n14, n11) %>%
+    dplyr::summarise(count = sum(count)) %>%
+    ungroup()
+}, mc.cores = 3)
+
+lapply(1:3, function(x){write_delim(bind_rows(unq.n11.n14[[x]] %>%
+                                               dplyr::select(-n) %>%
+                                               dplyr::select(n14, n11, count),
+                                             fix.non.unq.n11.n14[[x]]) %>%
+                                      dplyr::rename(N14 = n14, N11 = n11), paste0("../5-final/RNA.rep",x,".counts.tsv"), delim = "\t")})
+```
+
+
+
+
+
+
+

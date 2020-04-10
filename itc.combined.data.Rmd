@@ -1,0 +1,174 @@
+---
+title: "Combine crosslinking, RNA-seq, template datasets"
+output: html_notebook
+---
+## Packages
+```{r, warning=F}
+library(tidyverse)
+library(parallel)
+library(stringdist)
+```
+
+## Combine RNA and template datasets
+```{r}
+rna <- lapply(1:3, function(x) {read_delim(paste0("../5-final/RNA.rep", x, ".counts.tsv"),  delim = "\t")})
+template <- lapply(1:3, function(x) {read_delim(paste0("../5-final/template.rep", x, ".counts.tsv"),  delim = "\t")})
+
+rna.temp <- lapply(1:3, function(x){full_join(rna[[x]], template[[x]], by = "N14", suffix = c(".rna", ".temp"))})
+
+n11.in.both <- lapply(1:3, function(x){
+  rna.temp[[x]] %>%
+    filter(!is.na(N11.rna) & !is.na(N11.temp)) %>%
+    rowwise() %>% 
+    mutate(dist = adist(N11.rna, N11.temp)) %>%
+    ungroup() %>%
+    filter(dist <= 3) %>%
+    mutate(N11 = ifelse(count.rna > count.temp, N11.rna, N11.temp)) %>%
+    dplyr::select(-c(dist, N11.temp, N11.rna))
+})
+
+n11.in.one <- lapply(1:3, function(x){
+  rna.temp[[x]] %>%
+    filter(is.na(N11.rna) | is.na(N11.temp)) %>%
+    filter(count.rna >= 5 | count.temp >= 5) %>%
+    mutate(N11 = ifelse(is.na(N11.temp), N11.rna, N11.temp)) %>%
+    dplyr::select(-c(N11.temp, N11.rna))
+})
+
+rna.temp.w.n11 <- lapply(1:3, function(x)bind_rows(n11.in.both[[x]], n11.in.one[[x]])) %>%
+  purrr::reduce(full_join, by = "N14")
+```
+
+```{r}
+names(rna.temp.w.n11) <- c("N14", 
+                           "count.rna.1", "count.temp.1", "N11.1", 
+                           "count.rna.2", "count.temp.2", "N11.2", 
+                           "count.rna.3", "count.temp.3", "N11.3")
+
+## Remove N14 with multiple N11 across replicates
+rna.temp.w.n11 <- rna.temp.w.n11 %>% 
+  rowwise() %>% 
+  mutate(N11.cnt = n_distinct(na.omit(c(N11.1, N11.2, N11.3))),
+         N11 = unique(na.omit(c(N11.1, N11.2, N11.3)))[1]) %>% 
+  ungroup() %>%
+  filter(N11.cnt == 1) %>%
+  dplyr::select(-c(N11.1, N11.2, N11.3, N11.cnt))
+
+write_delim(rna.temp.w.n11, "../5-final/rna-template.ind.counts.tsv", delim = "\t")
+
+comb.rna.temp.w.n11 <- rna.temp.w.n11 %>%
+  rowwise() %>%
+  mutate(count.template = sum(count.temp.1, count.temp.2, count.temp.3, na.rm = T),
+         count.rna = sum(count.rna.1, count.rna.2, count.rna.3, na.rm = T)) %>%
+  ungroup() %>%
+  dplyr::select(N14, N11, count.template, count.rna)
+
+write_delim(comb.rna.temp.w.n11, "../5-final/rna-template.comb.counts.tsv", delim = "\t")
+```
+
+## Combine crosslinking data with RNA-seq and template count data
+```{r}
+# Read in crosslinking data
+cross.WO.rif <- lapply(1:3, function(x) read_delim(paste0("../5-final/crosslink.no.rif.rep", x, ".counts.tsv"), "\t") %>% dplyr::rename(count.cross = total))
+
+cross.W.rif <- lapply(1:3, function(x) read_delim(paste0("../5-final/crosslink.rif.rep", x, ".counts.tsv"), "\t") %>% dplyr::rename(count.cross = total))
+
+tmp <- list()
+tmp[[1]] <- rna.temp.w.n11 %>% 
+  dplyr::select(N14, N11, count.rna.1, count.temp.1) %>% 
+  dplyr::rename(count.rna = count.rna.1, count.template = count.temp.1)
+tmp[[2]] <- rna.temp.w.n11 %>% 
+  dplyr::select(N14, N11, count.rna.2, count.temp.2) %>% 
+  dplyr::rename(count.rna = count.rna.2, count.template = count.temp.2)
+tmp[[3]] <- rna.temp.w.n11 %>% 
+  dplyr::select(N14, N11, count.rna.3, count.temp.3) %>% 
+  dplyr::rename(count.rna = count.rna.3, count.template = count.temp.3)
+
+write_ind_cross <- function(crossdata, rnatempdata, outfile){
+  left_join(crossdata, rnatempdata, by = "N14") %>%
+  filter(!is.na(N11)) %>%
+  group_by(N11, RNALength) %>%
+  dplyr::summarise(count.cross = sum(count.cross, na.rm = T),
+                   count.template = sum(count.template, na.rm = T),
+                   count.rna = sum(count.rna, na.rm = T)) %>%
+  write_delim(., outfile, "\t")
+}
+
+lapply(1:3, function(x){write_ind_cross(cross.WO.rif[[x]], tmp[[x]], paste0("../5-final/N11.rep", x, ".no.rif.alldata.tsv"))})
+lapply(1:3, function(x){write_ind_cross(cross.W.rif[[x]], tmp[[x]], paste0("../5-final/N11.rep", x, ".rif.alldata.tsv"))})
+
+```
+
+## For individual reps, remove N11 whose crosslinks are predominantly at RNALength > 10
+```{r}
+remove_downstream_rif_N11 <- function(x){
+  rif <- read_delim(paste0("../5-final/N11.rep", x, ".rif.alldata.tsv"), "\t")
+  no.rif <- read_delim(paste0("../5-final/N11.rep", x, ".no.rif.alldata.tsv"), "\t")
+  
+  rif %>% 
+    dplyr::select(-c(count.template, count.rna)) %>% 
+    group_by(N11) %>% 
+    dplyr::summarise(up = sum(count.cross[RNALength<10],na.rm = T), 
+                     down = sum(count.cross[RNALength>=10], na.rm=T)) %>%
+    mutate(ratio = down/(up+down)) %>%
+    filter(ratio >= 0.9) %>%
+    dplyr::select(N11) %>%
+    anti_join(no.rif, ., by = "N11") %>%
+    write_delim(paste0("../5-final/N11.rep", x, ".no.rif.removed.rif.tsv"), "\t")
+}
+
+lapply(1:3, remove_downstream_rif_N11)
+```
+
+## For combined reps, remove N11 whose crosslinks are predominantly at RNALength > 10
+```{r}
+comb.rna.temp.w.n11
+comb.cross.W.rif <- cross.W.rif %>% 
+  bind_rows() %>%
+  group_by(N14, RNALength) %>%
+  dplyr::summarise(count.cross = sum(count.cross)) %>%
+  ungroup() %>%
+  write_delim(., "../5-final/crosslink.rif.counts.all.tsv", "\t")
+
+
+comb.cross.WO.rif <- cross.WO.rif %>% 
+  bind_rows() %>%
+  group_by(N14, RNALength) %>%
+  dplyr::summarise(count.cross = sum(count.cross)) %>%
+  ungroup() %>%
+  write_delim(., "../5-final/crosslink.no.rif.counts.all.tsv", "\t")
+
+comb.rna.temp.w.n11.WO.n14 <- comb.rna.temp.w.n11 %>%
+  group_by(N11) %>%
+  dplyr::summarise(count.template = sum(count.template),
+                   count.rna = sum(count.rna)) %>%
+  ungroup()
+
+comb.cross.W.rif.rna.temp <- left_join(comb.cross.W.rif, comb.rna.temp.w.n11 %>% dplyr::select(N14, N11), by = "N14") %>%
+  filter(!is.na(N11)) %>%
+  group_by(N11, RNALength) %>%
+  dplyr::summarise(count.cross = sum(count.cross, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(., comb.rna.temp.w.n11.WO.n14, by = "N11") %>%
+  write_delim(., "../5-final/N11.rif.tsv", "\t")
+
+comb.cross.WO.rif.rna.temp <- left_join(comb.cross.WO.rif, comb.rna.temp.w.n11 %>% dplyr::select(N14, N11), by = "N14") %>%
+  filter(!is.na(N11)) %>%
+  group_by(N11, RNALength) %>%
+  dplyr::summarise(count.cross = sum(count.cross, na.rm = T)) %>%
+  ungroup() %>%
+  left_join(., comb.rna.temp.w.n11.WO.n14, by = "N11") %>%
+  write_delim(., "../5-final/N11.no.rif.tsv", "\t")
+
+comb.cross.W.rif.rna.temp %>% 
+    dplyr::select(-c(count.template, count.rna)) %>% 
+    group_by(N11) %>% 
+    dplyr::summarise(up = sum(count.cross[RNALength<10],na.rm = T), 
+                     down = sum(count.cross[RNALength>=10], na.rm=T)) %>%
+    mutate(ratio = down/(up+down)) %>%
+    filter(ratio >= 0.9) %>%
+    dplyr::select(N11) %>%
+    anti_join(comb.cross.WO.rif.rna.temp, ., by = "N11") %>%
+    write_delim(paste0("../5-final/N11.no.rif.removed.rif.tsv"), "\t")
+```
+
